@@ -2,6 +2,28 @@ import cv2
 import numpy as np
 from PIL import Image
 import random
+import requests
+import io
+
+# --- Optional: External API key for better wound recognition ---
+DEEP_AI_KEY = "YOUR_API_KEY"  # Replace with your actual API key
+
+def analyze_with_api(pil_image):
+    """
+    Use external API (DeepAI or similar) for wound detection if OpenCV fails.
+    """
+    buffered = io.BytesIO()
+    pil_image.save(buffered, format="PNG")
+    buffered.seek(0)
+
+    response = requests.post(
+        "https://api.deepai.org/api/image-similarity",  # Replace with actual wound detection API
+        files={"image": buffered},
+        headers={"api-key": DEEP_AI_KEY}
+    )
+    result = response.json()
+    # You can parse result to extract wound_area, redness etc.
+    return result
 
 def analyze_wound(pil_image):
     """
@@ -14,9 +36,25 @@ def analyze_wound(pil_image):
 
     # --- Step 1: Find the largest contour (the wound) ---
     gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-    # Use adaptive thresholding for better results in varied lighting
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 11, 2)
+
+    # --- Improved preprocessing for better recognition ---
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    # Apply Contrast Limited Adaptive Histogram Equalization (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(blurred)
+
+    # Use adaptive thresholding for varied lighting
+    thresh = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 15, 4
+    )
+
+    # Morphological operations to clean noise
+    kernel = np.ones((5, 5), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -42,14 +80,23 @@ def analyze_wound(pil_image):
         # --- Step 4: Isolate the wound and analyze color ---
         mask = np.zeros(gray.shape, np.uint8)
         cv2.drawContours(mask, [largest_contour], -1, 255, -1)
-        # Calculate the average color of the wound area
+
+        # Smooth mask to reduce jagged edges
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # Calculate average color of wound area
         mean_color = cv2.mean(open_cv_image, mask=mask)[:3]
-        
+
         # Simple logic for infection risk based on redness
-        # BGR format, so Red is index 2
-        if mean_color[2] > 150: # High red component
+        if mean_color[2] > 150:  # Red channel
             wound_color_analysis["redness"] = round(mean_color[2])
-            
+    else:
+        # --- Optional: fallback to API if no wound detected ---
+        api_result = analyze_with_api(pil_image)
+        # Map API result to wound_area and redness (adjust as needed)
+        wound_area = api_result.get("wound_area", 0)
+        wound_color_analysis["redness"] = api_result.get("redness", 0)
+
     # Convert processed image back to PIL format
     final_image = Image.fromarray(cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB))
 
@@ -60,20 +107,28 @@ def get_detailed_report(wound_area, color_analysis):
     Generates a more detailed, less random report based on area and color.
     """
     # Healing Score Logic: Smaller area = better score
-    # Normalize score (e.g., assuming max area is 50000 px)
     healing_score = max(0, 100 - (wound_area / 50000) * 100)
     
     infection_risk = "Low"
     description = "The wound appears to be healing well. The tissue is closing, and inflammation is minimal."
 
-    if color_analysis["redness"] > 160: # Threshold for significant redness
+    if color_analysis["redness"] > 160:
         infection_risk = "High"
         description = "Significant redness detected, which may indicate inflammation or potential infection. Monitor closely."
-        healing_score -= 20 # Penalize score for redness
+        healing_score -= 20
     elif color_analysis["redness"] > 140:
         infection_risk = "Medium"
         description = "Moderate redness is present. Continue to observe for signs of infection."
         healing_score -= 10
+
+    # Add short wound description based on area
+    if wound_area < 2000:
+        short_desc = " Small wound, minimal tissue damage."
+    elif wound_area < 10000:
+        short_desc = " Moderate wound, some inflammation observed."
+    else:
+        short_desc = " Large wound, significant tissue involvement. Monitor closely."
+    description += short_desc
 
     report = {
         "description": description,
